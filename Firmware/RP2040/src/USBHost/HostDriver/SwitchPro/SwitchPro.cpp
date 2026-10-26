@@ -43,14 +43,35 @@ bool try_hid_out(uint8_t address, uint8_t instance, const void* report, uint16_t
     return try_hid_out_id(address, instance, 0, report, len);
 }
 
-/** Always re-arm HID IN immediately — never wait on Xbox/device output. */
 bool switch_rearm_hid_in(uint8_t address, uint8_t instance) {
     const bool ok = tuh_hid_receive_report(address, instance);
     InputSlot::note_rearm(ok);
     return ok;
 }
 
-constexpr uint8_t kInitForceAdvanceRetries = 8;
+constexpr uint8_t kWiredHandshakeMaxRetries = 6;
+constexpr uint8_t kSubcmdMaxRetries = 6;
+constexpr uint32_t kSubcmdSpacingMs = 50U;
+constexpr uint32_t kZeroImuWakeIntervalMs = 1000U;
+constexpr uint16_t kZeroImuWakeThreshold = 80U;
+constexpr uint32_t kActiveRumbleIntervalMs = 32U;
+constexpr uint32_t kIdleKeepaliveIntervalMs = 1000U;
+
+struct SlotRuntimeState {
+    uint32_t last_cmd_ms{0};
+    uint32_t last_rumble_ms{0};
+    uint16_t zero_imu_frames{0};
+    uint8_t last_rumble_l{0};
+    uint8_t last_rumble_r{0};
+    bool wake_send_mode_next{false};
+};
+
+std::array<SlotRuntimeState, MAX_GAMEPADS> s_slot_runtime{};
+
+SlotRuntimeState& get_slot_runtime(uint8_t idx) {
+    const size_t i = (static_cast<size_t>(idx) < s_slot_runtime.size()) ? static_cast<size_t>(idx) : 0U;
+    return s_slot_runtime[i];
+}
 
 } // namespace
 
@@ -82,6 +103,7 @@ void SwitchProHost::disconnect_cb(Gamepad& gamepad, uint8_t address, uint8_t ins
     (void)gamepad;
     (void)address;
     (void)instance;
+    get_slot_runtime(idx_) = SlotRuntimeState{};
     switch2_cancel_bringup();
 }
 
@@ -127,6 +149,9 @@ void SwitchProHost::initialize(Gamepad& gamepad, uint8_t address, uint8_t instan
 
     std::memset(&out_report_, 0, sizeof(out_report_));
     std::memset(&prev_in_report_, 0, sizeof(prev_in_report_));
+    std::memset(prev_imu_, 0, sizeof(prev_imu_));
+    get_slot_runtime(idx_) = SlotRuntimeState{};
+
     sequence_counter_ = 0;
     hid_instance_ = instance;
     switch2_dev_addr_ = address;
@@ -142,23 +167,6 @@ void SwitchProHost::initialize(Gamepad& gamepad, uint8_t address, uint8_t instan
     uint16_t vid = 0;
     uint16_t pid = 0;
     tuh_vid_pid_get(address, &vid, &pid);
-
-#if defined(CONFIG_OGXM_DEBUG)
-    OGXM_LOG("\n================================================\n");
-    OGXM_LOG("INPUT DRIVER OWNERSHIP\n");
-    OGXM_LOG("================================================\n");
-    OGXM_LOG("VID:\n%04X\n", vid);
-    OGXM_LOG("PID:\n%04X\n", pid);
-    OGXM_LOG("Physical device:\n%s\n",
-             (vid == 0x057E && pid == 0x2009) ? "SWITCH_PRO_COMPATIBLE (057E:2009)" : "UNKNOWN/OTHER");
-    OGXM_LOG("Session affinity:\nNO (SwitchProHost path — not Cyclone claim)\n");
-    OGXM_LOG("Transport:\nUSB\n");
-    OGXM_LOG("Mode:\nSWITCH\n");
-    OGXM_LOG("Physical driver:\nSWITCH_PRO\n");
-    OGXM_LOG("Protocol engine:\nSWITCH_PRO_STANDARD\n");
-    OGXM_LOG("Parser:\nSwitchProHost\n");
-    OGXM_LOG("================================================\n");
-#endif
 
     if (is_switch2_usb_family(vid, pid))
     {
@@ -467,7 +475,6 @@ void SwitchProHost::switch2_finish_bringup()
 
     if (bulk_complete)
     {
-        /* Switch 2–family: bulk bring-up replaces Switch 1 wired 0x80 HID init. */
         init_state_ = InitState::DONE;
         pending_usb_ack_ = 0;
         pending_subcmd_ack_ = 0;
@@ -491,19 +498,15 @@ bool SwitchProHost::send_usb_wired_command(uint8_t address, uint8_t instance, ui
 
 void SwitchProHost::start_usb_wired_init(uint8_t address, uint8_t instance)
 {
+    SlotRuntimeState& slot = get_slot_runtime(idx_);
     init_state_ = InitState::USB_MAC;
+    init_step_retries_ = 0;
     pending_usb_ack_ = SwitchPro::CMD::USB_SUB_MAC;
-#if defined(CONFIG_OGXM_DEBUG)
-    OGXM_LOG("\n[SWITCH USB INIT]\ndriver object: SwitchProHost\ninit called: YES\nsetup started: YES\n");
-    OGXM_LOG("IN endpoint: (HID ep_in via TinyUSB)\nOUT endpoint: (HID ep_out via TinyUSB)\n");
-#endif
-    (void)send_usb_wired_command(address, instance, SwitchPro::CMD::USB_SUB_MAC);
-    const bool armed = tuh_hid_receive_report(address, instance);
-#if defined(CONFIG_OGXM_DEBUG)
-    OGXM_LOG("input transfer armed: %s\n", armed ? "YES" : "NO");
-#else
-    (void)armed;
-#endif
+    if (send_usb_wired_command(address, instance, SwitchPro::CMD::USB_SUB_MAC))
+    {
+        slot.last_cmd_ms = board_api::ms_since_boot();
+    }
+    (void)tuh_hid_receive_report(address, instance);
 }
 
 void SwitchProHost::fill_neutral_rumble(SwitchPro::OutReport& out)
@@ -520,19 +523,35 @@ void SwitchProHost::fill_neutral_rumble(SwitchPro::OutReport& out)
 
 void SwitchProHost::advance_after_usb_ack(Gamepad& gamepad, uint8_t address, uint8_t instance)
 {
+    (void)gamepad;
+    SlotRuntimeState& slot = get_slot_runtime(idx_);
+    init_step_retries_ = 0;
+
     switch (init_state_)
     {
         case InitState::USB_MAC:
             init_state_ = InitState::USB_HANDSHAKE1;
-            (void)send_usb_wired_command(address, instance, SwitchPro::CMD::USB_SUB_HANDSHAKE);
+            pending_usb_ack_ = SwitchPro::CMD::USB_SUB_HANDSHAKE;
+            if (send_usb_wired_command(address, instance, SwitchPro::CMD::USB_SUB_HANDSHAKE))
+            {
+                slot.last_cmd_ms = board_api::ms_since_boot();
+            }
             break;
         case InitState::USB_HANDSHAKE1:
             init_state_ = InitState::USB_BAUD;
-            (void)send_usb_wired_command(address, instance, SwitchPro::CMD::USB_SUB_BAUD);
+            pending_usb_ack_ = SwitchPro::CMD::USB_SUB_BAUD;
+            if (send_usb_wired_command(address, instance, SwitchPro::CMD::USB_SUB_BAUD))
+            {
+                slot.last_cmd_ms = board_api::ms_since_boot();
+            }
             break;
         case InitState::USB_BAUD:
             init_state_ = InitState::USB_HANDSHAKE2;
-            (void)send_usb_wired_command(address, instance, SwitchPro::CMD::USB_SUB_HANDSHAKE);
+            pending_usb_ack_ = SwitchPro::CMD::USB_SUB_HANDSHAKE;
+            if (send_usb_wired_command(address, instance, SwitchPro::CMD::USB_SUB_HANDSHAKE))
+            {
+                slot.last_cmd_ms = board_api::ms_since_boot();
+            }
             break;
         case InitState::USB_HANDSHAKE2:
             init_state_ = InitState::USB_NO_TIMEOUT;
@@ -545,30 +564,18 @@ void SwitchProHost::advance_after_usb_ack(Gamepad& gamepad, uint8_t address, uin
 
 void SwitchProHost::send_usb_disable_timeout_and_probe(uint8_t address, uint8_t instance)
 {
+    (void)init_profile_;
+    SlotRuntimeState& slot = get_slot_runtime(idx_);
+
     send_usb_disable_timeout(address, instance);
     usb_timeout_sent_ = true;
+    pending_usb_ack_ = 0;
     init_step_retries_ = 0;
+    slot.last_cmd_ms = board_api::ms_since_boot();
 
-    if (init_profile_ == InitProfile::MinimalReportMode)
-    {
-#if defined(CONFIG_OGXM_DEBUG)
-        OGXM_LOG("\n[CYCLONE2 SWITCH]\nUSB handshake: PASS (disable-timeout sent)\n");
-        OGXM_LOG("Minimal init: DEVICE_INFO then SET_REPORT_MODE 0x30 (report ID 0x01)\n");
-#endif
-        /* Standard first subcommand — wait for real 0x21 before SET_MODE. */
-        (void)send_subcmd_report(address, instance, SwitchPro::SUBCMD_DEVICE_INFO, nullptr, 0);
-        init_state_ = InitState::FULL_REPORT; /* next step after DEVICE_INFO ack */
-        return;
-    }
-
-    std::memset(&out_report_, 0, sizeof(out_report_));
-    fill_neutral_rumble(out_report_);
-    /* Nintendo rumble+subcmd report ID is 0x01 (not legacy 0x12). */
-    out_report_.command = SwitchPro::REPORT_ID_OUTPUT_SUBCMD;
-    out_report_.sequence_counter = get_output_sequence_counter();
-    out_report_.sub_command = SwitchPro::CMD::USB_PROBE;
-    pending_subcmd_ack_ = SwitchPro::CMD::USB_PROBE;
-    (void)try_hid_out(address, instance, &out_report_, 11);
+    /* Move cleanly to IMU enable on the next 50ms window after 0x80 0x04 completes. */
+    init_state_ = InitState::IMU;
+    pending_subcmd_ack_ = SwitchPro::CMD::GYRO;
 }
 
 bool SwitchProHost::send_subcmd_report(uint8_t address, uint8_t instance, uint8_t subcmd,
@@ -586,7 +593,6 @@ bool SwitchProHost::send_subcmd_report(uint8_t address, uint8_t instance, uint8_
         std::memcpy(out_report_.sub_command_args, args, n);
     }
     pending_subcmd_ack_ = subcmd;
-    /* Length: command + seq + rumble(8) + subcmd + args (min 1 arg slot). */
     const uint16_t len = static_cast<uint16_t>(11 + (args_len > 0 ? args_len : 0));
     return try_hid_out(address, instance, &out_report_, len > 12 ? len : 12);
 }
@@ -600,91 +606,108 @@ void SwitchProHost::send_usb_disable_timeout(uint8_t address, uint8_t instance)
 
 void SwitchProHost::init_switch_host(Gamepad& gamepad, uint8_t address, uint8_t instance)
 {
-    (void)gamepad;
+    if (!tuh_hid_send_ready(address, instance))
+    {
+        return;
+    }
+
+    SlotRuntimeState& slot = get_slot_runtime(idx_);
+    const uint32_t now = board_api::ms_since_boot();
+    if (slot.last_cmd_ms != 0 && (now - slot.last_cmd_ms) < kSubcmdSpacingMs)
+    {
+        return;
+    }
 
     if (init_state_ <= InitState::USB_HANDSHAKE2)
     {
-        if (pending_usb_ack_ != 0)
+        if (++init_step_retries_ >= kWiredHandshakeMaxRetries)
         {
-            (void)send_usb_wired_command(address, instance, pending_usb_ack_);
+            advance_after_usb_ack(gamepad, address, instance);
+        }
+        else if (pending_usb_ack_ != 0 && send_usb_wired_command(address, instance, pending_usb_ack_))
+        {
+            slot.last_cmd_ms = now;
         }
         return;
     }
 
     if (init_state_ == InitState::USB_NO_TIMEOUT)
     {
-        if (!usb_timeout_sent_)
-        {
-            send_usb_disable_timeout_and_probe(address, instance);
-        }
+        send_usb_disable_timeout_and_probe(address, instance);
         return;
     }
-
-    if (!tuh_hid_send_ready(address, instance))
-    {
-        return;
-    }
-
-    if (init_profile_ == InitProfile::MinimalReportMode)
-    {
-        /* Retries only resend pending subcmd — never mark DONE without protocol success. */
-        if (init_state_ == InitState::FULL_REPORT &&
-            pending_subcmd_ack_ == SwitchPro::SUBCMD_DEVICE_INFO)
-        {
-            (void)send_subcmd_report(address, instance, SwitchPro::SUBCMD_DEVICE_INFO, nullptr, 0);
-        }
-        else if ((init_state_ == InitState::FULL_REPORT ||
-                  init_state_ == InitState::AWAIT_FULL_REPORT) &&
-                 pending_subcmd_ack_ == SwitchPro::SUBCMD_SET_MODE)
-        {
-            const uint8_t mode = SwitchPro::CMD::FULL_REPORT_MODE;
-            (void)send_subcmd_report(address, instance, SwitchPro::SUBCMD_SET_MODE, &mode, 1);
-        }
-        return;
-    }
-
-    std::memset(&out_report_, 0, sizeof(out_report_));
-    fill_neutral_rumble(out_report_);
-    out_report_.command = SwitchPro::REPORT_ID_OUTPUT_SUBCMD;
-    out_report_.sequence_counter = get_output_sequence_counter();
 
     switch (init_state_)
     {
-        case InitState::LED:
-            out_report_.sub_command = SwitchPro::CMD::LED;
-            out_report_.sub_command_args[0] = idx_ + 1;
-            if (try_hid_out(address, instance, &out_report_, 12))
-            {
-                init_state_ = InitState::LED_HOME;
-            }
-            break;
-        case InitState::LED_HOME:
-            out_report_.sub_command = SwitchPro::CMD::LED_HOME;
-            out_report_.sub_command_args[0] = static_cast<uint8_t>((0 << 4) | 0xF);
-            out_report_.sub_command_args[1] = static_cast<uint8_t>((0xF << 4) | 0x0);
-            out_report_.sub_command_args[2] = static_cast<uint8_t>((0xF << 4) | 0x0);
-            if (try_hid_out(address, instance, &out_report_, 14))
+        case InitState::IMU:
+        {
+            if (init_step_retries_ >= kSubcmdMaxRetries)
             {
                 init_state_ = InitState::FULL_REPORT;
+                init_step_retries_ = 0;
+                slot.last_cmd_ms = 0;
+                break;
             }
-            break;
-        case InitState::FULL_REPORT:
-            out_report_.sub_command = SwitchPro::CMD::MODE;
-            out_report_.sub_command_args[0] = SwitchPro::CMD::FULL_REPORT_MODE;
-            if (try_hid_out(address, instance, &out_report_, 12))
+            const uint8_t enable = 1;
+            if (send_subcmd_report(address, instance, SwitchPro::CMD::GYRO, &enable, 1))
             {
-                init_state_ = InitState::IMU;
+                ++init_step_retries_;
+                slot.last_cmd_ms = now;
             }
             break;
-        case InitState::IMU:
-            out_report_.sub_command = SwitchPro::CMD::GYRO;
-            out_report_.sub_command_args[0] = 1;
-            if (try_hid_out(address, instance, &out_report_, 12))
+        }
+        case InitState::FULL_REPORT:
+        {
+            if (init_step_retries_ >= kSubcmdMaxRetries)
+            {
+                init_state_ = InitState::AWAIT_FULL_REPORT;
+                init_step_retries_ = 0;
+                slot.last_cmd_ms = 0;
+                break;
+            }
+            const uint8_t mode = SwitchPro::CMD::FULL_REPORT_MODE;
+            if (send_subcmd_report(address, instance, SwitchPro::SUBCMD_SET_MODE, &mode, 1))
+            {
+                ++init_step_retries_;
+                slot.last_cmd_ms = now;
+            }
+            break;
+        }
+        case InitState::AWAIT_FULL_REPORT:
+        {
+            /* Re-assert 0x40 0x01 after 0x03 0x30 for clones that reset IMU state on mode switch. */
+            if (init_step_retries_ >= kSubcmdMaxRetries)
+            {
+                init_state_ = InitState::LED;
+                init_step_retries_ = 0;
+                slot.last_cmd_ms = 0;
+                break;
+            }
+            const uint8_t enable = 1;
+            if (send_subcmd_report(address, instance, SwitchPro::CMD::GYRO, &enable, 1))
+            {
+                ++init_step_retries_;
+                slot.last_cmd_ms = now;
+            }
+            break;
+        }
+        case InitState::LED:
+        {
+            if (init_step_retries_ >= 3)
             {
                 init_state_ = InitState::DONE;
                 pending_subcmd_ack_ = 0;
+                init_step_retries_ = 0;
+                break;
+            }
+            const uint8_t player_led = static_cast<uint8_t>(idx_ + 1);
+            if (send_subcmd_report(address, instance, SwitchPro::CMD::LED, &player_led, 1))
+            {
+                ++init_step_retries_;
+                slot.last_cmd_ms = now;
             }
             break;
+        }
         default:
             break;
     }
@@ -724,6 +747,25 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
     if (payload == nullptr || payload_len < sizeof(SwitchPro::InReport))
     {
         return;
+    }
+
+    constexpr uint16_t kMinImuPayloadLen = 11U + sizeof(MotionImu::SwitchImuSample);
+    SlotRuntimeState& slot = get_slot_runtime(idx_);
+
+    if (payload_len >= kMinImuPayloadLen)
+    {
+        const uint16_t imu_off = MotionImu::switch_usb_imu_offset(payload, payload_len);
+        if (MotionImu::switch_imu_sample_is_zero(payload + imu_off))
+        {
+            if (slot.zero_imu_frames < 1000U)
+            {
+                ++slot.zero_imu_frames;
+            }
+        }
+        else
+        {
+            slot.zero_imu_frames = 0;
+        }
     }
 
     const SwitchPro::InReport* in_report = reinterpret_cast<const SwitchPro::InReport*>(payload);
@@ -783,7 +825,7 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
     std::tie(gp_in.joystick_rx, gp_in.joystick_ry) =
         gamepad.scale_joystick_r(normalize_axis(joy_rx), normalize_axis(joy_ry), true);
 
-    if (payload_len >= 22) {
+    if (payload_len >= kMinImuPayloadLen) {
         gp_in.motion_source = Gamepad::PadIn::MOTION_SRC_SWITCH_USB;
         MotionImu::fill_from_switch_usb_payload(gp_in.accel, gp_in.gyro, payload, payload_len);
     }
@@ -791,13 +833,8 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
     gamepad.set_pad_in_latest(gp_in);
     InputSlot::note_decoded();
     std::memcpy(&prev_in_report_, in_report, sizeof(SwitchPro::InReport));
-    if (payload_len >= 22) {
-        constexpr uint16_t kInReportSize = 10;
-        constexpr uint16_t kImuSampleSize = sizeof(MotionImu::SwitchImuSample);
-        uint16_t imu_off = kInReportSize;
-        if (payload_len >= kInReportSize + (3 * kImuSampleSize)) {
-            imu_off = static_cast<uint16_t>(kInReportSize + (2 * kImuSampleSize));
-        }
+    if (payload_len >= kMinImuPayloadLen) {
+        const uint16_t imu_off = MotionImu::switch_usb_imu_offset(payload, payload_len);
         std::memcpy(prev_imu_, payload + imu_off, sizeof(prev_imu_));
     }
 }
@@ -811,27 +848,10 @@ void SwitchProHost::process_report(Gamepad& gamepad, uint8_t address, uint8_t in
         return;
     }
 
+    SlotRuntimeState& slot = get_slot_runtime(idx_);
+
     if (init_state_ != InitState::DONE)
     {
-#if defined(CONFIG_OGXM_DEBUG)
-        static uint32_t s_init_skip_logs = 0;
-        if (report && len > 0 && s_init_skip_logs < 16) {
-            const uint8_t rid = report[0];
-            if (rid == SwitchPro::REPORT_ID_STANDARD || rid == SwitchPro::REPORT_ID_FULL_ALT ||
-                rid == 0x3F || rid == SwitchPro::REPORT_ID_SUBCMD || rid == SwitchPro::REPORT_ID_USB_INIT) {
-                ++s_init_skip_logs;
-                OGXM_LOG("\n[SWITCH PARSER ENTER]\naddr=%u instance=%u report_id=0x%02X len=%u\n",
-                         address, instance, rid, static_cast<unsigned>(len));
-                if (rid == SwitchPro::REPORT_ID_STANDARD || rid == SwitchPro::REPORT_ID_FULL_ALT) {
-                    OGXM_LOG("note=0x30/0x31 during init (minimal may accept)\n");
-                } else if (rid == 0x3F) {
-                    OGXM_LOG("REJECTED\nreason=simple 0x3F until SET_MODE 0x30\n");
-                } else {
-                    OGXM_LOG("ACCEPTED (handshake/init path)\n");
-                }
-            }
-        }
-#endif
         if (len >= 2 && report[0] == SwitchPro::REPORT_ID_USB_INIT &&
             init_state_ <= InitState::USB_HANDSHAKE2)
         {
@@ -844,66 +864,88 @@ void SwitchProHost::process_report(Gamepad& gamepad, uint8_t address, uint8_t in
         else if (len >= 15 && report[0] == SwitchPro::REPORT_ID_SUBCMD)
         {
             const uint8_t reply_sub = report[14];
-            if (init_profile_ == InitProfile::MinimalReportMode)
+            if (init_state_ == InitState::IMU && reply_sub == SwitchPro::CMD::GYRO)
             {
-                if (pending_subcmd_ack_ != 0 && reply_sub == pending_subcmd_ack_)
-                {
-                    if (reply_sub == SwitchPro::SUBCMD_DEVICE_INFO)
-                    {
-#if defined(CONFIG_OGXM_DEBUG)
-                        OGXM_LOG("[CYCLONE2 SWITCH]\nstandard subcommand (DEVICE_INFO): PASS\n");
-#endif
-                        const uint8_t mode = SwitchPro::CMD::FULL_REPORT_MODE;
-                        init_state_ = InitState::AWAIT_FULL_REPORT;
-                        (void)send_subcmd_report(address, instance, SwitchPro::SUBCMD_SET_MODE, &mode, 1);
-                    }
-                    else if (reply_sub == SwitchPro::SUBCMD_SET_MODE)
-                    {
-                        set_mode_acked_ = true;
-                        pending_subcmd_ack_ = 0;
-#if defined(CONFIG_OGXM_DEBUG)
-                        OGXM_LOG("[CYCLONE2 SWITCH]\nSET_REPORT_MODE 0x30: PASS (0x21)\n");
-                        OGXM_LOG("waiting for usable 0x30 input before READY\n");
-#endif
-                    }
-                }
+                init_state_ = InitState::FULL_REPORT;
+                init_step_retries_ = 0;
+                slot.last_cmd_ms = 0;
+                init_switch_host(gamepad, address, instance);
             }
-            else if (init_state_ == InitState::USB_NO_TIMEOUT)
+            else if (init_state_ == InitState::FULL_REPORT && reply_sub == SwitchPro::SUBCMD_SET_MODE)
+            {
+                set_mode_acked_ = true;
+                init_state_ = InitState::AWAIT_FULL_REPORT;
+                init_step_retries_ = 0;
+                slot.last_cmd_ms = 0;
+                init_switch_host(gamepad, address, instance);
+            }
+            else if (init_state_ == InitState::AWAIT_FULL_REPORT && reply_sub == SwitchPro::CMD::GYRO)
             {
                 init_state_ = InitState::LED;
-                pending_subcmd_ack_ = 0;
+                init_step_retries_ = 0;
+                slot.last_cmd_ms = 0;
                 init_switch_host(gamepad, address, instance);
             }
-            else if (init_state_ > InitState::USB_NO_TIMEOUT)
+            else if (init_state_ == InitState::LED && reply_sub == SwitchPro::CMD::LED)
             {
-                init_switch_host(gamepad, address, instance);
+                init_state_ = InitState::DONE;
+                pending_subcmd_ack_ = 0;
+                init_step_retries_ = 0;
             }
         }
-        else if (init_profile_ == InitProfile::MinimalReportMode &&
-                 set_mode_acked_ &&
-                 len >= 2 &&
+        else if (len >= 2 &&
                  (report[0] == SwitchPro::REPORT_ID_STANDARD ||
                   report[0] == SwitchPro::REPORT_ID_FULL_ALT))
         {
-#if defined(CONFIG_OGXM_DEBUG)
-            OGXM_LOG("\n[CYCLONE2 SWITCH]\n[RAW RX] ID=0x%02X\nREADY (usable standard input)\n",
-                     report[0]);
-#endif
-            init_state_ = InitState::DONE;
+            /* Decode live input even while final IMU/LED subcommands finish. */
             apply_standard_input(gamepad, report, len);
+            init_switch_host(gamepad, address, instance);
             (void)switch_rearm_hid_in(address, instance);
             return;
         }
-        else if (init_profile_ != InitProfile::MinimalReportMode &&
-                 init_state_ > InitState::USB_NO_TIMEOUT)
+        else
         {
             init_switch_host(gamepad, address, instance);
         }
+
+        (void)switch_rearm_hid_in(address, instance);
+        return;
+    }
+
+    /* Self-heal if wireless controller wakes up or re-pairs in simple 0x3F mode after dongle init. */
+    if (len >= 1 && report[0] == 0x3F)
+    {
+        init_state_ = InitState::IMU;
+        init_step_retries_ = 0;
+        slot.last_cmd_ms = 0;
+        init_switch_host(gamepad, address, instance);
         (void)switch_rearm_hid_in(address, instance);
         return;
     }
 
     apply_standard_input(gamepad, report, len);
+
+    /* Self-heal if wireless controller connected late and is streaming 0x30 with IMU still asleep. */
+    if (slot.zero_imu_frames >= kZeroImuWakeThreshold)
+    {
+        const uint32_t now = board_api::ms_since_boot();
+        if ((now - slot.last_cmd_ms) >= kZeroImuWakeIntervalMs && tuh_hid_send_ready(address, instance))
+        {
+            if (slot.wake_send_mode_next)
+            {
+                const uint8_t mode = SwitchPro::CMD::FULL_REPORT_MODE;
+                (void)send_subcmd_report(address, instance, SwitchPro::SUBCMD_SET_MODE, &mode, 1);
+            }
+            else
+            {
+                const uint8_t enable = 1;
+                (void)send_subcmd_report(address, instance, SwitchPro::CMD::GYRO, &enable, 1);
+            }
+            slot.wake_send_mode_next = !slot.wake_send_mode_next;
+            slot.last_cmd_ms = now;
+        }
+    }
+
     (void)switch_rearm_hid_in(address, instance);
 }
 
@@ -931,32 +973,16 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
 
     if (init_state_ != InitState::DONE)
     {
-        if (init_profile_ == InitProfile::MinimalReportMode)
-        {
-            /* Never READY-by-timeout: only resend pending protocol step. */
-            init_switch_host(gamepad, address, instance);
-            tuh_hid_receive_report(address, instance);
-            service_usb_host();
-            return false;
-        }
-        if (init_state_ == InitState::USB_NO_TIMEOUT)
-        {
-            if (++init_step_retries_ >= kInitForceAdvanceRetries)
-            {
-                init_state_ = InitState::LED;
-                pending_subcmd_ack_ = 0;
-                usb_timeout_sent_ = false;
-            }
-        }
         init_switch_host(gamepad, address, instance);
         tuh_hid_receive_report(address, instance);
         service_usb_host();
         return false;
     }
 
+    const uint32_t now_ms = board_api::ms_since_boot();
+
     if (switch2_device)
     {
-        const uint32_t now_ms = board_api::ms_since_boot();
         if (now_ms - switch2_last_bulk_keepalive_ms_ >= 2000U)
         {
             switch2_last_bulk_keepalive_ms_ = now_ms;
@@ -964,18 +990,38 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
         }
     }
 
-    std::memset(&out_report_, 0, sizeof(out_report_));
+    SlotRuntimeState& slot = get_slot_runtime(idx_);
 
+    /* Rate-limit RUMBLE_ONLY packets so PIO-USB and the 2.4GHz RF link are never flooded. */
+    Gamepad::PadOut gp_out = gamepad.get_pad_out();
+    const bool rumble_changed = (gp_out.rumble_l != slot.last_rumble_l) || (gp_out.rumble_r != slot.last_rumble_r);
+    const bool rumble_active = (gp_out.rumble_l > 0) || (gp_out.rumble_r > 0);
+    const uint32_t min_interval = rumble_active ? kActiveRumbleIntervalMs : kIdleKeepaliveIntervalMs;
+
+    if (!rumble_changed && (now_ms - slot.last_rumble_ms) < min_interval)
+    {
+        return false;
+    }
+
+    if (!tuh_hid_send_ready(address, instance))
+    {
+        return false;
+    }
+
+    /* Do not step on a recent zero-IMU wake subcommand. */
+    if (slot.zero_imu_frames >= kZeroImuWakeThreshold && (now_ms - slot.last_cmd_ms) < 100U)
+    {
+        return false;
+    }
+
+    std::memset(&out_report_, 0, sizeof(out_report_));
     out_report_.command = SwitchPro::CMD::RUMBLE_ONLY;
     out_report_.sequence_counter = get_output_sequence_counter();
     fill_neutral_rumble(out_report_);
 
-    Gamepad::PadOut gp_out = gamepad.get_pad_out();
-
     if (gp_out.rumble_l > 0)
     {
         uint8_t amplitude_l = static_cast<uint8_t>(((gp_out.rumble_l / 255.0f) * 0.8f + 0.5f) * (0xC0 - 0x40) + 0x40);
-
         out_report_.rumble_l[0] = amplitude_l;
         out_report_.rumble_l[1] = 0x88;
         out_report_.rumble_l[2] = amplitude_l / 2;
@@ -985,16 +1031,18 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
     if (gp_out.rumble_r > 0)
     {
         uint8_t amplitude_r = static_cast<uint8_t>(((gp_out.rumble_r / 255.0f) * 0.8f + 0.5f) * (0xC0 - 0x40) + 0x40);
-
         out_report_.rumble_r[0] = amplitude_r;
         out_report_.rumble_r[1] = 0x88;
         out_report_.rumble_r[2] = amplitude_r / 2;
         out_report_.rumble_r[3] = 0x61;
     }
 
-    if (!tuh_hid_send_ready(address, instance))
+    if (tuh_hid_send_report(address, instance, 0, &out_report_, 10))
     {
-        return false;
+        slot.last_rumble_l = gp_out.rumble_l;
+        slot.last_rumble_r = gp_out.rumble_r;
+        slot.last_rumble_ms = now_ms;
+        return true;
     }
-    return tuh_hid_send_report(address, instance, 0, &out_report_, 10);
+    return false;
 }
