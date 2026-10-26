@@ -49,13 +49,13 @@ bool switch_rearm_hid_in(uint8_t address, uint8_t instance) {
     return ok;
 }
 
-constexpr uint8_t kWiredHandshakeMaxRetries = 6;
-constexpr uint8_t kSubcmdMaxRetries = 6;
+constexpr uint8_t kWiredHandshakeMaxRetries = 5;
+constexpr uint8_t kSubcmdMaxRetries = 5;
 constexpr uint32_t kSubcmdSpacingMs = 50U;
 constexpr uint32_t kZeroImuWakeIntervalMs = 1000U;
 constexpr uint16_t kZeroImuWakeThreshold = 80U;
 constexpr uint32_t kActiveRumbleIntervalMs = 32U;
-constexpr uint32_t kIdleKeepaliveIntervalMs = 1000U;
+constexpr uint32_t kIdleKeepaliveIntervalMs = 2000U;
 
 struct SlotRuntimeState {
     uint32_t last_cmd_ms{0};
@@ -573,9 +573,9 @@ void SwitchProHost::send_usb_disable_timeout_and_probe(uint8_t address, uint8_t 
     init_step_retries_ = 0;
     slot.last_cmd_ms = board_api::ms_since_boot();
 
-    /* Move cleanly to IMU enable on the next 50ms window after 0x80 0x04 completes. */
-    init_state_ = InitState::IMU;
-    pending_subcmd_ack_ = SwitchPro::CMD::GYRO;
+    /* Step 1 after 0x80 0x04: send SUBCMD_DEVICE_INFO (0x02) on next 50ms slot for wired + wireless clones. */
+    init_state_ = InitState::LED_HOME;
+    pending_subcmd_ack_ = SwitchPro::SUBCMD_DEVICE_INFO;
 }
 
 bool SwitchProHost::send_subcmd_report(uint8_t address, uint8_t instance, uint8_t subcmd,
@@ -639,6 +639,23 @@ void SwitchProHost::init_switch_host(Gamepad& gamepad, uint8_t address, uint8_t 
 
     switch (init_state_)
     {
+        case InitState::LED_HOME:
+        {
+            /* Repurposed for SUBCMD_DEVICE_INFO (0x02) first subcommand required by strict wired pads. */
+            if (init_step_retries_ >= 4)
+            {
+                init_state_ = InitState::IMU;
+                init_step_retries_ = 0;
+                slot.last_cmd_ms = 0;
+                break;
+            }
+            if (send_subcmd_report(address, instance, SwitchPro::SUBCMD_DEVICE_INFO, nullptr, 0))
+            {
+                ++init_step_retries_;
+                slot.last_cmd_ms = now;
+            }
+            break;
+        }
         case InitState::IMU:
         {
             if (init_step_retries_ >= kSubcmdMaxRetries)
@@ -675,8 +692,7 @@ void SwitchProHost::init_switch_host(Gamepad& gamepad, uint8_t address, uint8_t 
         }
         case InitState::AWAIT_FULL_REPORT:
         {
-            /* Re-assert 0x40 0x01 after 0x03 0x30 for clones that reset IMU state on mode switch. */
-            if (init_step_retries_ >= kSubcmdMaxRetries)
+            if (init_step_retries_ >= 4)
             {
                 init_state_ = InitState::LED;
                 init_step_retries_ = 0;
@@ -749,13 +765,13 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
         return;
     }
 
-    constexpr uint16_t kMinImuPayloadLen = 11U + sizeof(MotionImu::SwitchImuSample);
     SlotRuntimeState& slot = get_slot_runtime(idx_);
+    MotionImu::SwitchImuSample cur_imu{};
+    const bool has_imu = MotionImu::switch_usb_extract_sample(cur_imu, payload, payload_len);
 
-    if (payload_len >= kMinImuPayloadLen)
+    if (has_imu)
     {
-        const uint16_t imu_off = MotionImu::switch_usb_imu_offset(payload, payload_len);
-        if (MotionImu::switch_imu_sample_is_zero(payload + imu_off))
+        if (MotionImu::switch_imu_sample_is_zero(reinterpret_cast<const uint8_t*>(&cur_imu)))
         {
             if (slot.zero_imu_frames < 1000U)
             {
@@ -825,7 +841,7 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
     std::tie(gp_in.joystick_rx, gp_in.joystick_ry) =
         gamepad.scale_joystick_r(normalize_axis(joy_rx), normalize_axis(joy_ry), true);
 
-    if (payload_len >= kMinImuPayloadLen) {
+    if (has_imu) {
         gp_in.motion_source = Gamepad::PadIn::MOTION_SRC_SWITCH_USB;
         MotionImu::fill_from_switch_usb_payload(gp_in.accel, gp_in.gyro, payload, payload_len);
     }
@@ -833,9 +849,8 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
     gamepad.set_pad_in_latest(gp_in);
     InputSlot::note_decoded();
     std::memcpy(&prev_in_report_, in_report, sizeof(SwitchPro::InReport));
-    if (payload_len >= kMinImuPayloadLen) {
-        const uint16_t imu_off = MotionImu::switch_usb_imu_offset(payload, payload_len);
-        std::memcpy(prev_imu_, payload + imu_off, sizeof(prev_imu_));
+    if (has_imu) {
+        std::memcpy(prev_imu_, &cur_imu, sizeof(prev_imu_));
     }
 }
 
@@ -864,7 +879,14 @@ void SwitchProHost::process_report(Gamepad& gamepad, uint8_t address, uint8_t in
         else if (len >= 15 && report[0] == SwitchPro::REPORT_ID_SUBCMD)
         {
             const uint8_t reply_sub = report[14];
-            if (init_state_ == InitState::IMU && reply_sub == SwitchPro::CMD::GYRO)
+            if (init_state_ == InitState::LED_HOME && reply_sub == SwitchPro::SUBCMD_DEVICE_INFO)
+            {
+                init_state_ = InitState::IMU;
+                init_step_retries_ = 0;
+                slot.last_cmd_ms = 0;
+                init_switch_host(gamepad, address, instance);
+            }
+            else if (init_state_ == InitState::IMU && reply_sub == SwitchPro::CMD::GYRO)
             {
                 init_state_ = InitState::FULL_REPORT;
                 init_step_retries_ = 0;
@@ -897,7 +919,6 @@ void SwitchProHost::process_report(Gamepad& gamepad, uint8_t address, uint8_t in
                  (report[0] == SwitchPro::REPORT_ID_STANDARD ||
                   report[0] == SwitchPro::REPORT_ID_FULL_ALT))
         {
-            /* Decode live input even while final IMU/LED subcommands finish. */
             apply_standard_input(gamepad, report, len);
             init_switch_host(gamepad, address, instance);
             (void)switch_rearm_hid_in(address, instance);
@@ -912,7 +933,6 @@ void SwitchProHost::process_report(Gamepad& gamepad, uint8_t address, uint8_t in
         return;
     }
 
-    /* Self-heal if wireless controller wakes up or re-pairs in simple 0x3F mode after dongle init. */
     if (len >= 1 && report[0] == 0x3F)
     {
         init_state_ = InitState::IMU;
@@ -925,7 +945,6 @@ void SwitchProHost::process_report(Gamepad& gamepad, uint8_t address, uint8_t in
 
     apply_standard_input(gamepad, report, len);
 
-    /* Self-heal if wireless controller connected late and is streaming 0x30 with IMU still asleep. */
     if (slot.zero_imu_frames >= kZeroImuWakeThreshold)
     {
         const uint32_t now = board_api::ms_since_boot();
@@ -992,7 +1011,6 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
 
     SlotRuntimeState& slot = get_slot_runtime(idx_);
 
-    /* Rate-limit RUMBLE_ONLY packets so PIO-USB and the 2.4GHz RF link are never flooded. */
     Gamepad::PadOut gp_out = gamepad.get_pad_out();
     const bool rumble_changed = (gp_out.rumble_l != slot.last_rumble_l) || (gp_out.rumble_r != slot.last_rumble_r);
     const bool rumble_active = (gp_out.rumble_l > 0) || (gp_out.rumble_r > 0);
@@ -1008,7 +1026,6 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
         return false;
     }
 
-    /* Do not step on a recent zero-IMU wake subcommand. */
     if (slot.zero_imu_frames >= kZeroImuWakeThreshold && (now_ms - slot.last_cmd_ms) < 100U)
     {
         return false;
