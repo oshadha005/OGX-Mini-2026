@@ -29,6 +29,17 @@ struct SwitchImuSample
 
 static_assert(sizeof(SwitchImuSample) == 12);
 
+inline int16_t clamp_i16(int32_t v)
+{
+    if (v > 32767) {
+        return 32767;
+    }
+    if (v < -32768) {
+        return -32768;
+    }
+    return static_cast<int16_t>(v);
+}
+
 inline bool switch_imu_sample_is_zero(const uint8_t* p)
 {
     for (size_t i = 0; i < sizeof(SwitchImuSample); ++i) {
@@ -40,30 +51,47 @@ inline bool switch_imu_sample_is_zero(const uint8_t* p)
 }
 
 /**
- * In Switch 0x30/0x31 reports, payload = report + 2:
+ * Extract 6-axis IMU from Switch 0x30/0x31 payload (payload = report + 2).
  * payload[0..9]  = battery + buttons(3) + sticks(6) (report[2..11])
- * payload[10]    = vibrator input report            (report[12])
+ * payload[10]    = vibrator input byte              (report[12])
  * payload[11..22]= IMU sample 0                     (report[13..24])
  * payload[23..34]= IMU sample 1                     (report[25..36])
  * payload[35..46]= IMU sample 2                     (report[37..48])
- * Many 2.4GHz / clone S-Input pads only populate sample 0 and zero-pad samples 1-2.
+ * If all 3 samples are populated, average them to preserve full sub-frame motion and cut noise.
  */
-inline uint16_t switch_usb_imu_offset(const uint8_t* payload, uint16_t payload_len)
+inline bool switch_usb_extract_sample(SwitchImuSample& out, const uint8_t* payload, uint16_t payload_len)
 {
     constexpr uint16_t kInReportSize = 11;
     constexpr uint16_t kImuSampleSize = sizeof(SwitchImuSample);
 
+    if (payload_len < kInReportSize + kImuSampleSize) {
+        std::memset(&out, 0, sizeof(out));
+        return false;
+    }
+
+    SwitchImuSample s0{};
+    std::memcpy(&s0, payload + kInReportSize, sizeof(s0));
+
     if (payload_len >= kInReportSize + (3 * kImuSampleSize)) {
-        const uint16_t s2 = static_cast<uint16_t>(kInReportSize + (2 * kImuSampleSize));
-        if (!switch_imu_sample_is_zero(payload + s2)) {
-            return s2;
-        }
-        const uint16_t s1 = static_cast<uint16_t>(kInReportSize + kImuSampleSize);
-        if (!switch_imu_sample_is_zero(payload + s1)) {
-            return s1;
+        const uint8_t* p1 = payload + kInReportSize + kImuSampleSize;
+        const uint8_t* p2 = payload + kInReportSize + (2 * kImuSampleSize);
+        if (!switch_imu_sample_is_zero(p1) && !switch_imu_sample_is_zero(p2)) {
+            SwitchImuSample s1{};
+            SwitchImuSample s2{};
+            std::memcpy(&s1, p1, sizeof(s1));
+            std::memcpy(&s2, p2, sizeof(s2));
+            for (int i = 0; i < 3; ++i) {
+                out.accel[i] = static_cast<int16_t>(
+                    (static_cast<int32_t>(s0.accel[i]) + s1.accel[i] + s2.accel[i]) / 3);
+                out.gyro[i] = static_cast<int16_t>(
+                    (static_cast<int32_t>(s0.gyro[i]) + s1.gyro[i] + s2.gyro[i]) / 3);
+            }
+            return true;
         }
     }
-    return kInReportSize;
+
+    out = s0;
+    return true;
 }
 
 inline int32_t ds4_ds5_usb_raw_to_units(int16_t raw, int32_t range)
@@ -97,10 +125,8 @@ inline void fill_from_ds5_usb_raw(int32_t accel[3], int32_t gyro[3], const uint1
 
 inline void fill_from_switch_usb_payload(int32_t accel[3], int32_t gyro[3], const uint8_t* payload, uint16_t payload_len)
 {
-    constexpr uint16_t kInReportSize = 11;
-    constexpr uint16_t kImuSampleSize = sizeof(SwitchImuSample);
-
-    if (payload_len < kInReportSize + kImuSampleSize) {
+    SwitchImuSample raw{};
+    if (!switch_usb_extract_sample(raw, payload, payload_len)) {
         for (int i = 0; i < 3; i++) {
             accel[i] = 0;
             gyro[i] = 0;
@@ -108,38 +134,22 @@ inline void fill_from_switch_usb_payload(int32_t accel[3], int32_t gyro[3], cons
         return;
     }
 
-    const uint16_t imu_off = switch_usb_imu_offset(payload, payload_len);
-
-    SwitchImuSample raw{};
-    std::memcpy(&raw, payload + imu_off, sizeof(raw));
-
-    const int32_t accel_div = kSwitchDefaultAccelScale;
-    const int32_t gyro_div = kSwitchDefaultGyroScale;
     for (int i = 0; i < 3; i++) {
-        if (accel_div != 0) {
-            accel[i] = (static_cast<int32_t>(raw.accel[i]) * kSwitchDefaultAccelScale) / accel_div;
-        } else {
-            accel[i] = raw.accel[i];
-        }
-        if (gyro_div != 0) {
-            const int64_t num = static_cast<int64_t>(kSwitchGyroPrecScale) * static_cast<int32_t>(raw.gyro[i]);
-            gyro[i] = static_cast<int32_t>((num * kSwitchDefaultGyroScale) / gyro_div);
-        } else {
-            gyro[i] = raw.gyro[i];
-        }
+        /* Switch accel is +-8G (4096 LSB/G); DS4 expects +-4G (8192 LSB/G). Clamp in int32 first. */
+        const int16_t ds4_accel = clamp_i16(static_cast<int32_t>(raw.accel[i]) * 2);
+        accel[i] = ds4_ds5_usb_raw_to_units(ds4_accel, kDs4AccRange);
+        /* Both Switch Pro and DS4 gyros use +-2000 dps signed 16-bit full scale (~16.38 LSB/dps). */
+        gyro[i] = ds4_ds5_usb_raw_to_units(raw.gyro[i], kDs4GyroRange);
     }
 }
 
 inline bool switch_usb_imu_unchanged(const uint8_t* prev_imu, const uint8_t* payload, uint16_t payload_len)
 {
-    constexpr uint16_t kInReportSize = 11;
-    constexpr uint16_t kImuSampleSize = sizeof(SwitchImuSample);
-    if (payload_len < kInReportSize + kImuSampleSize) {
+    SwitchImuSample cur{};
+    if (!switch_usb_extract_sample(cur, payload, payload_len)) {
         return true;
     }
-
-    const uint16_t imu_off = switch_usb_imu_offset(payload, payload_len);
-    return std::memcmp(prev_imu, payload + imu_off, kImuSampleSize) == 0;
+    return std::memcmp(prev_imu, &cur, sizeof(cur)) == 0;
 }
 
 inline void fill_from_wii_bt(int32_t accel[3], int32_t gyro[3], const int32_t wii_accel[3])
@@ -237,17 +247,6 @@ inline void remap_to_ds4_playing_frame(uint8_t motion_source, int32_t accel[3], 
     }
 }
 
-inline int16_t clamp_i16(int32_t v)
-{
-    if (v > 32767) {
-        return 32767;
-    }
-    if (v < -32768) {
-        return -32768;
-    }
-    return static_cast<int16_t>(v);
-}
-
 inline void encode_switch_imu_sample(SwitchImuSample& out, const Gamepad::PadIn& gp_in)
 {
     if (!gp_in.has_motion()) {
@@ -263,7 +262,7 @@ inline void encode_switch_imu_sample(SwitchImuSample& out, const Gamepad::PadIn&
     int32_t az = gp_in.accel[2];
     int32_t gx = gp_in.gyro[0];
     int32_t gy = gp_in.gyro[1];
-    int32_t gz = gp_in.gyro[1 + 1];
+    int32_t gz = gp_in.gyro[2];
 
     int32_t sx = 0;
     int32_t sy = 0;
@@ -274,13 +273,20 @@ inline void encode_switch_imu_sample(SwitchImuSample& out, const Gamepad::PadIn&
 
     switch (gp_in.motion_source) {
         case Gamepad::PadIn::MOTION_SRC_SWITCH_PRO:
-        case Gamepad::PadIn::MOTION_SRC_SWITCH_USB:
             out.accel[0] = clamp_i16(ax);
             out.accel[1] = clamp_i16(ay);
             out.accel[2] = clamp_i16(az);
             out.gyro[0] = clamp_i16(gx / kSwitchGyroPrecScale);
             out.gyro[1] = clamp_i16(gy / kSwitchGyroPrecScale);
             out.gyro[2] = clamp_i16(gz / kSwitchGyroPrecScale);
+            return;
+        case Gamepad::PadIn::MOTION_SRC_SWITCH_USB:
+            out.accel[0] = clamp_i16(ax / 2);
+            out.accel[1] = clamp_i16(ay / 2);
+            out.accel[2] = clamp_i16(az / 2);
+            out.gyro[0] = clamp_i16(static_cast<int32_t>((static_cast<int64_t>(gx) * kRawSensDenom) / kDs4GyroRange));
+            out.gyro[1] = clamp_i16(static_cast<int32_t>((static_cast<int64_t>(gy) * kRawSensDenom) / kDs4GyroRange));
+            out.gyro[2] = clamp_i16(static_cast<int32_t>((static_cast<int64_t>(gz) * kRawSensDenom) / kDs4GyroRange));
             return;
         case Gamepad::PadIn::MOTION_SRC_WII_BT:
             sx = -az;
