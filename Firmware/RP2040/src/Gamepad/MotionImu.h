@@ -29,6 +29,43 @@ struct SwitchImuSample
 
 static_assert(sizeof(SwitchImuSample) == 12);
 
+inline bool switch_imu_sample_is_zero(const uint8_t* p)
+{
+    for (size_t i = 0; i < sizeof(SwitchImuSample); ++i) {
+        if (p[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * In Switch 0x30/0x31 reports, payload = report + 2:
+ * payload[0..9]  = battery + buttons(3) + sticks(6) (report[2..11])
+ * payload[10]    = vibrator input report            (report[12])
+ * payload[11..22]= IMU sample 0                     (report[13..24])
+ * payload[23..34]= IMU sample 1                     (report[25..36])
+ * payload[35..46]= IMU sample 2                     (report[37..48])
+ * Many 2.4GHz / clone S-Input pads only populate sample 0 and zero-pad samples 1-2.
+ */
+inline uint16_t switch_usb_imu_offset(const uint8_t* payload, uint16_t payload_len)
+{
+    constexpr uint16_t kInReportSize = 11;
+    constexpr uint16_t kImuSampleSize = sizeof(SwitchImuSample);
+
+    if (payload_len >= kInReportSize + (3 * kImuSampleSize)) {
+        const uint16_t s2 = static_cast<uint16_t>(kInReportSize + (2 * kImuSampleSize));
+        if (!switch_imu_sample_is_zero(payload + s2)) {
+            return s2;
+        }
+        const uint16_t s1 = static_cast<uint16_t>(kInReportSize + kImuSampleSize);
+        if (!switch_imu_sample_is_zero(payload + s1)) {
+            return s1;
+        }
+    }
+    return kInReportSize;
+}
+
 inline int32_t ds4_ds5_usb_raw_to_units(int16_t raw, int32_t range)
 {
     return static_cast<int32_t>((static_cast<int64_t>(range) * static_cast<int64_t>(raw)) / kRawSensDenom);
@@ -58,10 +95,9 @@ inline void fill_from_ds5_usb_raw(int32_t accel[3], int32_t gyro[3], const uint1
     }
 }
 
-/* Bluepad default factory cal when SPI calib is unavailable (wired USB). */
 inline void fill_from_switch_usb_payload(int32_t accel[3], int32_t gyro[3], const uint8_t* payload, uint16_t payload_len)
 {
-    constexpr uint16_t kInReportSize = 10;
+    constexpr uint16_t kInReportSize = 11;
     constexpr uint16_t kImuSampleSize = sizeof(SwitchImuSample);
 
     if (payload_len < kInReportSize + kImuSampleSize) {
@@ -72,10 +108,7 @@ inline void fill_from_switch_usb_payload(int32_t accel[3], int32_t gyro[3], cons
         return;
     }
 
-    uint16_t imu_off = kInReportSize;
-    if (payload_len >= kInReportSize + (3 * kImuSampleSize)) {
-        imu_off = static_cast<uint16_t>(kInReportSize + (2 * kImuSampleSize));
-    }
+    const uint16_t imu_off = switch_usb_imu_offset(payload, payload_len);
 
     SwitchImuSample raw{};
     std::memcpy(&raw, payload + imu_off, sizeof(raw));
@@ -99,21 +132,16 @@ inline void fill_from_switch_usb_payload(int32_t accel[3], int32_t gyro[3], cons
 
 inline bool switch_usb_imu_unchanged(const uint8_t* prev_imu, const uint8_t* payload, uint16_t payload_len)
 {
-    constexpr uint16_t kInReportSize = 10;
+    constexpr uint16_t kInReportSize = 11;
     constexpr uint16_t kImuSampleSize = sizeof(SwitchImuSample);
     if (payload_len < kInReportSize + kImuSampleSize) {
         return true;
     }
 
-    uint16_t imu_off = kInReportSize;
-    if (payload_len >= kInReportSize + (3 * kImuSampleSize)) {
-        imu_off = static_cast<uint16_t>(kInReportSize + (2 * kImuSampleSize));
-    }
-
+    const uint16_t imu_off = switch_usb_imu_offset(payload, payload_len);
     return std::memcmp(prev_imu, payload + imu_off, kImuSampleSize) == 0;
 }
 
-/* Bluepad Wii DRM_KA: centered int16 accel (~108 counts per G). */
 inline void fill_from_wii_bt(int32_t accel[3], int32_t gyro[3], const int32_t wii_accel[3])
 {
     for (int i = 0; i < 3; i++) {
@@ -122,14 +150,6 @@ inline void fill_from_wii_bt(int32_t accel[3], int32_t gyro[3], const int32_t wi
     }
 }
 
-/**
- * Switch motion UIs integrate gyro (Linux ABS_RX/RY/RZ), not accel (ABS_X/Y/Z).
- * Wiimote has no parsed MotionPlus gyro, so approximate rate from filtered gravity.
- *
- * hid-nintendo scales Pro gyro int16 by ~8k× (switch_raw 3 → ABS ~25k). Emit
- * instantaneous d(accel)/dt only (no accumulation), cap ±1. PadIn.gyro is
- * Switch-native int16. Still pose ⇒ gyro=0.
- */
 struct WiiPseudoGyroState
 {
     int32_t filt_accel[3];
@@ -165,7 +185,6 @@ inline void apply_wii_pseudo_gyro(int32_t accel[3], int32_t gyro[3], WiiPseudoGy
         dt = 40;
     }
 
-    /* ±1 → Linux ~8k; d=80 over 10 ms → raw 1. */
     constexpr int32_t kMaxRaw = 1;
     for (int i = 0; i < 3; i++) {
         int32_t d = st.filt_accel[i] - st.prev_filt[i];
@@ -186,11 +205,6 @@ inline void apply_wii_pseudo_gyro(int32_t accel[3], int32_t gyro[3], WiiPseudoGy
     st.prev_ms = now_ms;
 }
 
-/*
- * Rotate accel/gyro into the DS4/Sixaxis playing frame (+Z = 1 G when level, sticks up).
- * Switch Pro raw: X → triggers, Y → left, Z → out of face buttons.
- * Wiimote pointed at TV: gravity mostly on -Y; map to DS4 +Z neutral.
- */
 inline void remap_to_ds4_playing_frame(uint8_t motion_source, int32_t accel[3], int32_t gyro[3])
 {
     const int32_t ix = accel[0];
@@ -202,7 +216,6 @@ inline void remap_to_ds4_playing_frame(uint8_t motion_source, int32_t accel[3], 
 
     switch (motion_source) {
         case Gamepad::PadIn::MOTION_SRC_WII_BT:
-            /* Wiimote IR toward TV: gravity on -Y; map into DS4 playing frame. */
             accel[0] = -ix;
             accel[1] = iz;
             accel[2] = -iy;
@@ -235,18 +248,12 @@ inline int16_t clamp_i16(int32_t v)
     return static_cast<int16_t>(v);
 }
 
-/**
- * Encode PadIn motion into one Switch Pro IMU sample (little-endian int16
- * accel[3] + gyro[3]). PadIn units: Switch sources use Pro-native accel and
- * gyro*1000; DS4/DS5 use DS4 playing-frame units (8192/G); Wii uses Wiimote-frame
- * accel (DS4 units/g) and **Switch-native** gyro (see apply_wii_pseudo_gyro).
- */
 inline void encode_switch_imu_sample(SwitchImuSample& out, const Gamepad::PadIn& gp_in)
 {
     if (!gp_in.has_motion()) {
         out.accel[0] = 0;
         out.accel[1] = 0;
-        out.accel[2] = static_cast<int16_t>(kSwitchDefaultAccelScale); /* +1 G face-up */
+        out.accel[2] = static_cast<int16_t>(kSwitchDefaultAccelScale);
         out.gyro[0] = out.gyro[1] = out.gyro[2] = 0;
         return;
     }
@@ -256,7 +263,7 @@ inline void encode_switch_imu_sample(SwitchImuSample& out, const Gamepad::PadIn&
     int32_t az = gp_in.accel[2];
     int32_t gx = gp_in.gyro[0];
     int32_t gy = gp_in.gyro[1];
-    int32_t gz = gp_in.gyro[2];
+    int32_t gz = gp_in.gyro[1 + 1];
 
     int32_t sx = 0;
     int32_t sy = 0;
@@ -276,20 +283,17 @@ inline void encode_switch_imu_sample(SwitchImuSample& out, const Gamepad::PadIn&
             out.gyro[2] = clamp_i16(gz / kSwitchGyroPrecScale);
             return;
         case Gamepad::PadIn::MOTION_SRC_WII_BT:
-            /* Accel: Wiimote → Switch frame (DS4 units → Pro scale). */
             sx = -az;
             sy = ax;
             sz = ay;
             out.accel[0] = clamp_i16((sx * kSwitchDefaultAccelScale) / kDs4UnitsPerG);
             out.accel[1] = clamp_i16((sy * kSwitchDefaultAccelScale) / kDs4UnitsPerG);
             out.accel[2] = clamp_i16((sz * kSwitchDefaultAccelScale) / kDs4UnitsPerG);
-            /* Gyro already Switch-native; same axis remap (no /1000). */
             out.gyro[0] = clamp_i16(-gz);
             out.gyro[1] = clamp_i16(gx);
             out.gyro[2] = clamp_i16(gy);
             return;
         default:
-            /* DS4/DS5 PadIn is DS4 playing frame; invert Switch→DS4 remap. */
             sx = -ay;
             sy = -ax;
             sz = -az;
@@ -307,15 +311,6 @@ inline void encode_switch_imu_sample(SwitchImuSample& out, const Gamepad::PadIn&
     out.gyro[2] = clamp_i16(sgz / kSwitchGyroPrecScale);
 }
 
-/**
- * Write three IMU samples (36 bytes) at dest — Pro report 0x30 layout.
- * Real Pro spaces samples ~5 ms apart; keep a short history so hosts that
- * differentiate slots (or average them) see motion instead of three copies.
- *
- * Wii pseudo-gyro is a one-shot impulse: do **not** use history (it would
- * re-emit old gyro in older slots for 2–3 reports). Only the newest slot gets
- * gyro; the other two carry accel only.
- */
 struct SwitchImuHistory
 {
     SwitchImuSample samples[3];
