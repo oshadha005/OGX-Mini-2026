@@ -1,152 +1,118 @@
-#ifndef _SWITCH_PRO_DESCRIPTORS_H_
-#define _SWITCH_PRO_DESCRIPTORS_H_
+#ifndef _SWITCH_PRO_HOST_H_
+#define _SWITCH_PRO_HOST_H_
 
-#include <stdint.h>
+#include <array>
+#include <cstdint>
 
-/**
- * Shared Switch Pro Controller types for both USB Host (parsing a real Pro)
- * and USB Device (emulating a Pro). Host uses InReport, OutReport, CMD, Buttons*.
- * Device uses the same InReport (as SwitchReport), Btn, HAT_*, and descriptors from SwitchProDevice.h.
- */
-namespace SwitchPro
+#include "Descriptors/SwitchPro.h"
+#include "USBHost/HostDriver/HostDriver.h"
+
+struct tuh_xfer_s;
+
+class SwitchProHost : public HostDriver
 {
-#pragma pack(push, 1)
-	struct InReport
-	{
-		uint8_t batteryConnection;
-		uint8_t buttons[3];
-		union
-		{
-			uint8_t joysticks[6];
-			struct { uint8_t l[3]; uint8_t r[3]; };
-		};
-	};
-	static_assert(sizeof(InReport) == 10, "InReport must be 10 bytes");
+public:
+    SwitchProHost(uint8_t idx)
+        : HostDriver(idx) {}
 
-		struct OutReport
-		{
-			uint8_t command;
-			uint8_t sequence_counter;
-			uint8_t rumble_l[4];
-			uint8_t rumble_r[4];
-			uint8_t sub_command;
-			uint8_t sub_command_args[5];
-		};
-#pragma pack(pop)
+    void initialize(Gamepad& gamepad, uint8_t address, uint8_t instance, const uint8_t* report_desc, uint16_t desc_len) override;
+    void process_report(Gamepad& gamepad, uint8_t address, uint8_t instance, const uint8_t* report, uint16_t len) override;
+    bool send_feedback(Gamepad& gamepad, uint8_t address, uint8_t instance) override;
+    void disconnect_cb(Gamepad& gamepad, uint8_t address, uint8_t instance) override;
+    ~SwitchProHost() override;
 
-	namespace CMD
-	{
-		static constexpr uint8_t RUMBLE_ONLY       = 0x10;
-		static constexpr uint8_t HID               = 0x11;
-		static constexpr uint8_t HANDSHAKE        = 0x00;
-		static constexpr uint8_t DISABLE_TIMEOUT  = 0x01;
-		/** Rumble + subcommand output report ID (Nintendo / Bluepad32 / Chromium). */
-		static constexpr uint8_t AND_RUMBLE       = 0x01;
-		/** Legacy mistaken host TX ID some stacks used; device still accepts it. */
-		static constexpr uint8_t AND_RUMBLE_LEGACY = 0x12;
-		static constexpr uint8_t LED              = 0x30;
-		static constexpr uint8_t LED_HOME         = 0x38;
-		static constexpr uint8_t MODE             = 0x03;
-		static constexpr uint8_t FULL_REPORT_MODE = 0x30;
-		static constexpr uint8_t GYRO             = 0x40;
-		/** Unrecognized subcommand; sent after 0x80 0x04 so init gets a 0x21 ack. */
-		static constexpr uint8_t USB_PROBE        = 0x33;
-		/** Wired USB output report ID and subcommands (not Bluetooth 0x11 path). */
-		static constexpr uint8_t USB_OUT              = 0x80;
-		static constexpr uint8_t USB_SUB_MAC            = 0x01;
-		static constexpr uint8_t USB_SUB_HANDSHAKE      = 0x02;
-		static constexpr uint8_t USB_SUB_BAUD           = 0x03;
-		static constexpr uint8_t USB_SUB_DISABLE_TIMEOUT = 0x04;
-	}
+    static bool is_switch2_usb_family(uint16_t vid, uint16_t pid);
 
-	// First report byte (buttons_right): bit layout per real hardware / Bluepad32 parse_report_30_pro_controller
-	namespace Buttons0
-	{
-		static constexpr uint8_t Y  = (1U << 0);
-		static constexpr uint8_t X  = (1U << 1);
-		static constexpr uint8_t B  = (1U << 2);
-		static constexpr uint8_t A  = (1U << 3);
-		static constexpr uint8_t R  = (1U << 6);
-		static constexpr uint8_t ZR = (1U << 7);
-	}
-	namespace Buttons1
-	{
-		static constexpr uint8_t MINUS   = (1U << 0);
-		static constexpr uint8_t PLUS    = (1U << 1);
-		static constexpr uint8_t L3      = (1U << 2);
-		static constexpr uint8_t R3      = (1U << 3);
-		static constexpr uint8_t HOME    = (1U << 4);
-		static constexpr uint8_t CAPTURE = (1U << 5);
-	}
-	namespace Buttons2
-	{
-		static constexpr uint8_t DPAD_UP    = (1U << 0);
-		static constexpr uint8_t DPAD_DOWN  = (1U << 1);
-		static constexpr uint8_t DPAD_LEFT = (1U << 2);
-		static constexpr uint8_t DPAD_RIGHT= (1U << 3);
-		static constexpr uint8_t L         = (1U << 6);
-		static constexpr uint8_t ZL        = (1U << 7);
-	}
+    /**
+     * MinimalReportMode: USB handshake → device-info → SET_MODE 0x30 → wait for
+     * real 0x21 / usable 0x30. Skips LED/IMU/SPI. No READY-by-timeout.
+     * Call before initialize() (Cyclone Switch path).
+     */
+    enum class InitProfile : uint8_t { Full = 0, MinimalReportMode };
+    void set_init_profile(InitProfile profile) { init_profile_ = profile; }
 
-	using SwitchReport = InReport;
+protected:
+    enum class InitState
+    {
+        USB_MAC,
+        USB_HANDSHAKE1,
+        USB_BAUD,
+        USB_HANDSHAKE2,
+        USB_NO_TIMEOUT,
+        LED,
+        LED_HOME,
+        FULL_REPORT,
+        IMU,
+        VIBRATION,
+        /** Minimal: waiting for SET_MODE 0x21 then first 0x30. */
+        AWAIT_FULL_REPORT,
+        DONE
+    };
 
-	namespace Btn
-	{
-		static constexpr uint8_t Y       = Buttons0::Y;
-		static constexpr uint8_t B       = Buttons0::B;
-		static constexpr uint8_t A       = Buttons0::A;
-		static constexpr uint8_t X       = Buttons0::X;
-		static constexpr uint8_t R       = Buttons0::R;
-		static constexpr uint8_t ZR      = Buttons0::ZR;
-		static constexpr uint8_t MINUS   = Buttons1::MINUS;
-		static constexpr uint8_t PLUS    = Buttons1::PLUS;
-		static constexpr uint8_t L3      = Buttons1::L3;
-		static constexpr uint8_t R3      = Buttons1::R3;
-		static constexpr uint8_t HOME    = Buttons1::HOME;
-		static constexpr uint8_t CAPTURE = Buttons1::CAPTURE;
-		static constexpr uint8_t L       = Buttons2::L;
-		static constexpr uint8_t ZL      = Buttons2::ZL;
-	}
+    InitProfile init_profile_{InitProfile::Full};
+    InitState init_state_{InitState::USB_MAC};
+    uint8_t sequence_counter_{0};
+    uint8_t pending_usb_ack_{0};
+    uint8_t pending_subcmd_ack_{0};
+    uint8_t init_step_retries_{0};
+    bool usb_timeout_sent_{false};
+    bool set_mode_acked_{false};
 
-	static constexpr uint8_t HAT_NEUTRAL    = 0x00;
-	static constexpr uint8_t HAT_DOWN       = 0x01;
-	static constexpr uint8_t HAT_UP         = 0x02;
-	static constexpr uint8_t HAT_RIGHT      = 0x04;
-	static constexpr uint8_t HAT_LEFT       = 0x08;
-	static constexpr uint8_t HAT_DOWN_RIGHT = 0x05;
-	static constexpr uint8_t HAT_DOWN_LEFT  = 0x09;
-	static constexpr uint8_t HAT_UP_RIGHT   = 0x06;
-	static constexpr uint8_t HAT_UP_LEFT    = 0x0A;
+    SwitchPro::InReport prev_in_report_{};
+    uint8_t prev_imu_[12]{};
+    SwitchPro::OutReport out_report_{};
 
-	static constexpr uint16_t STICK_MIN = 0x000;
-	static constexpr uint16_t STICK_MID = 0x7FF;
-	static constexpr uint16_t STICK_MAX = 0xFFF;
+    uint8_t hid_instance_{0};
+    uint8_t switch2_dev_addr_{0};
+    uint8_t switch2_ep_out_{0};
+    uint8_t switch2_ep_in_{0};
+    bool switch2_bringup_active_{false};
+    Gamepad* switch2_gamepad_{nullptr};
+    std::array<uint8_t, 512> switch2_cfg_buf_{};
+    std::array<uint8_t, 64> switch2_bulk_out_buf_{};
+    std::array<uint8_t, 64> switch2_bulk_in_buf_{};
+    unsigned switch2_pkt_idx_{0};
+    uint32_t switch2_next_packet_ms_{0};
+    bool switch2_bringup_pending_retry_{false};
+    uint32_t switch2_last_bulk_keepalive_ms_{0};
+    bool switch2_bulk_keepalive_busy_{false};
 
-	static constexpr uint8_t REPORT_ID_OUTPUT_SUBCMD = 0x01;
-	static constexpr uint8_t REPORT_ID_OUTPUT_RUMBLE = 0x10;
-	static constexpr uint8_t REPORT_ID_STANDARD = 0x30;
-	/** Switch 2 Pro (USB) full input reports use 0x09; layout matches 0x30 after id + timer. */
-	static constexpr uint8_t REPORT_ID_SWITCH2_FULL = 0x09;
-	/** Alternate full-report id seen on some Switch-family USB stacks. */
-	static constexpr uint8_t REPORT_ID_FULL_ALT   = 0x31;
-	static constexpr uint8_t REPORT_ID_SUBCMD   = 0x21;
-	static constexpr uint8_t REPORT_ID_USB_INIT = 0x81;
-	static constexpr uint8_t REPORT_ID_USB_OUT  = 0x80;
-	static constexpr int     REPORT_SIZE        = 64;
-	static constexpr int     USB_INIT_REPORT_SIZE = 64;
+    void switch2_poll_bringup();
+    void switch2_start_bringup();
+    void switch2_start_config_read();
+    void switch2_cancel_bringup();
 
-	static constexpr uint8_t SUBCMD_BT_PAIR     = 0x01;
-	static constexpr uint8_t SUBCMD_DEVICE_INFO = 0x02;
-	static constexpr uint8_t SUBCMD_SET_MODE    = 0x03;
-	static constexpr uint8_t SUBCMD_TRIGGER     = 0x04;
-	static constexpr uint8_t SUBCMD_SHIPMENT    = 0x08;
-	static constexpr uint8_t SUBCMD_SPI_READ    = 0x10;
-	static constexpr uint8_t SUBCMD_NFC_IR_CFG  = 0x21;
-	static constexpr uint8_t SUBCMD_NFC_IR_STATE= 0x22;
-	static constexpr uint8_t SUBCMD_SET_PLAYER  = 0x30;
-	static constexpr uint8_t SUBCMD_IMU         = 0x40;
-	static constexpr uint8_t SUBCMD_IMU_SENS   = 0x41;
-	static constexpr uint8_t SUBCMD_VIBRATION   = 0x48;
-}
+    static uintptr_t switch2_make_cb_token(uint8_t daddr, uint8_t instance);
+    static SwitchProHost* switch2_lookup(uint8_t daddr, uint8_t instance);
+    bool switch2_parse_open_iface1(const uint8_t* desc_cfg, uint16_t buflen);
+    void switch2_submit_out_packet();
+    void switch2_submit_in_read();
+    void switch2_send_bulk_keepalive();
+    void switch2_after_packet_round();
+    void switch2_finish_bringup();
 
-#endif
+    static void switch2_cfg_cb(tuh_xfer_s* xfer);
+    static void switch2_out_cb(tuh_xfer_s* xfer);
+    static void switch2_in_cb(tuh_xfer_s* xfer);
+    static void switch2_keepalive_cb(tuh_xfer_s* xfer);
+
+    void init_switch_host(Gamepad& gamepad, uint8_t address, uint8_t instance);
+    void start_usb_wired_init(uint8_t address, uint8_t instance);
+    bool send_usb_wired_command(uint8_t address, uint8_t instance, uint8_t subcmd);
+    void advance_after_usb_ack(Gamepad& gamepad, uint8_t address, uint8_t instance);
+    void send_usb_disable_timeout_and_probe(uint8_t address, uint8_t instance);
+    void send_usb_disable_timeout(uint8_t address, uint8_t instance);
+    bool send_subcmd_report(uint8_t address, uint8_t instance, uint8_t subcmd,
+                            const uint8_t* args, uint8_t args_len);
+    void fill_neutral_rumble(SwitchPro::OutReport& out);
+    uint8_t get_output_sequence_counter();
+    void apply_standard_input(Gamepad& gamepad, const uint8_t* report, uint16_t len);
+
+    static inline int16_t normalize_axis(uint16_t value)
+    {
+        int32_t normalized_value = (value - 2047) * 22;
+        return Range::clamp<int16_t>(normalized_value);
+    }
+};
+
+#endif // _SWITCH_PRO_HOST_H_
