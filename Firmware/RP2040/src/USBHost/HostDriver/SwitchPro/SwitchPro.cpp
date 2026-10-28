@@ -54,22 +54,22 @@ constexpr uint8_t kInitForceAdvanceRetries = 8;
 constexpr uint8_t kSubcmdEnableVibration = 0x48;
 
 /**
- * Encodes an 8-bit motor intensity (0..255) into a valid 4-byte Switch rumble frame
- * locked to standard resonant frequencies (320 Hz High Band, 160 Hz Low Band).
+ * Encodes an 8-bit motor intensity (0..255) into Switch rumble format.
+ * Sends strict 0x00 across all bytes when intensity is 0 to ensure ERM motors spin down.
  */
 void encode_switch_rumble(uint8_t* dst, uint8_t intensity) {
     if (intensity == 0) {
         dst[0] = 0x00;
-        dst[1] = 0x01;
-        dst[2] = 0x40;
-        dst[3] = 0x40;
+        dst[1] = 0x00;
+        dst[2] = 0x00;
+        dst[3] = 0x00;
         return;
     }
     const uint8_t step = static_cast<uint8_t>(((static_cast<uint16_t>(intensity) * 99U) / 255U) + 1U);
-    dst[0] = 0x00;                                                        // 320 Hz HF upper byte
-    dst[1] = static_cast<uint8_t>(0x01U + (step * 2U));                   // 320 Hz HF LSB (0x01) + HF amp (0x02..0xC8)
-    dst[2] = static_cast<uint8_t>(0x40U | ((step & 1U) ? 0x80U : 0x00U)); // 160 Hz LF (0x40) + LF intermediate bit (0x80)
-    dst[3] = static_cast<uint8_t>(0x40U + (step / 2U));                   // LF amp (0x40..0x72)
+    dst[0] = 0x00;
+    dst[1] = static_cast<uint8_t>(0x01U + (step * 2U));
+    dst[2] = static_cast<uint8_t>(0x40U | ((step & 1U) ? 0x80U : 0x00U));
+    dst[3] = static_cast<uint8_t>(0x40U + (step / 2U));
 }
 
 } // namespace
@@ -528,14 +528,8 @@ void SwitchProHost::start_usb_wired_init(uint8_t address, uint8_t instance)
 
 void SwitchProHost::fill_neutral_rumble(SwitchPro::OutReport& out)
 {
-    out.rumble_l[0] = 0x00;
-    out.rumble_l[1] = 0x01;
-    out.rumble_l[2] = 0x40;
-    out.rumble_l[3] = 0x40;
-    out.rumble_r[0] = 0x00;
-    out.rumble_r[1] = 0x01;
-    out.rumble_r[2] = 0x40;
-    out.rumble_r[3] = 0x40;
+    std::memset(out.rumble_l, 0, sizeof(out.rumble_l));
+    std::memset(out.rumble_r, 0, sizeof(out.rumble_r));
 }
 
 void SwitchProHost::advance_after_usb_ack(Gamepad& gamepad, uint8_t address, uint8_t instance)
@@ -803,7 +797,7 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
     uint16_t joy_lx = in_report->joysticks[0] | ((in_report->joysticks[1] & 0xF) << 8);
     uint16_t joy_ly = (in_report->joysticks[1] >> 4) | (in_report->joysticks[2] << 4);
     uint16_t joy_rx = in_report->joysticks[3] | ((in_report->joysticks[4] & 0xF) << 8);
-    uint16_t joy_ry = (in_report->joysticks[4] >> 4) | (in_report->joysticks[5] >> 4);
+    uint16_t joy_ry = (in_report->joysticks[4] >> 4) | (in_report->joysticks[5] << 4);
 
     std::tie(gp_in.joystick_lx, gp_in.joystick_ly) =
         gamepad.scale_joystick_l(normalize_axis(joy_lx), normalize_axis(joy_ly), true);
@@ -998,19 +992,11 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
 
     out_report_.command = SwitchPro::CMD::RUMBLE_ONLY;
     out_report_.sequence_counter = get_output_sequence_counter();
-    fill_neutral_rumble(out_report_);
 
     Gamepad::PadOut gp_out = gamepad.get_pad_out();
 
-    if (gp_out.rumble_l > 0)
-    {
-        encode_switch_rumble(out_report_.rumble_l, gp_out.rumble_l);
-    }
-
-    if (gp_out.rumble_r > 0)
-    {
-        encode_switch_rumble(out_report_.rumble_r, gp_out.rumble_r);
-    }
+    encode_switch_rumble(out_report_.rumble_l, gp_out.rumble_l);
+    encode_switch_rumble(out_report_.rumble_r, gp_out.rumble_r);
 
     if (!tuh_hid_send_ready(address, instance))
     {
