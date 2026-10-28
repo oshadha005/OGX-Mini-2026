@@ -43,6 +43,7 @@ protected:
         LED_HOME,
         FULL_REPORT,
         IMU,
+        VIBRATION,
         /** Minimal: waiting for SET_MODE 0x21 then first 0x30. */
         AWAIT_FULL_REPORT,
         DONE
