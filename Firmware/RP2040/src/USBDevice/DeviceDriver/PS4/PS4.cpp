@@ -288,23 +288,27 @@ void PS4Device::set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t 
 
 	uint8_t rid = report_id;
 	const uint8_t *payload = buffer;
-	uint16_t payload_len = bufsize;
+	uint16_t len = bufsize;
 
 	if (rid == 0) {
 		rid = buffer[0];
 		payload = &buffer[1];
-		payload_len = static_cast<uint16_t>(bufsize - 1u);
+		len = static_cast<uint16_t>(bufsize - 1u);
 	}
 
 	if (rid == 0x05) {
-		if (payload[0] == 0x05 && payload_len >= sizeof(PS4::OutReport)) {
-			std::memcpy(&report_out_, payload, sizeof(PS4::OutReport));
-		} else {
+		/* DS4 USB Output Report (31 payload bytes without ID, or 32 with ID).
+		 * Byte offsets in raw payload (excluding Report ID 0x05):
+		 *   payload[0] = flags
+		 *   payload[3] = right motor (light/high freq)
+		 *   payload[4] = left motor (heavy/low freq)
+		 */
+		if (len >= 5) {
 			report_out_.report_id = 0x05;
-			const size_t copy_len = std::min<size_t>(payload_len, sizeof(PS4::OutReport) - 1u);
-			std::memcpy(reinterpret_cast<uint8_t*>(&report_out_) + 1, payload, copy_len);
+			report_out_.motor_right = payload[3];
+			report_out_.motor_left = payload[4];
+			new_report_out_ = true;
 		}
-		new_report_out_ = true;
 	}
 }
 
