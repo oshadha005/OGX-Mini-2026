@@ -1,6 +1,6 @@
 #ifndef _GAMEPAD_H_
 #define _GAMEPAD_H_
-
+#include <tuple>
 #include <cstdint>
 #include <atomic>
 #include <limits>
