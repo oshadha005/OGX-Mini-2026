@@ -233,12 +233,33 @@ void PS4Device::process(const uint8_t idx, Gamepad& gamepad)
 		tud_hid_report(0, report_in_.data(), static_cast<uint16_t>(report_in_.size()));
 	}
 
+	static absolute_time_t last_rumble_rx_time = { 0 };
+	static bool rumble_actively_commanded = false;
+
 	if (new_report_out_) {
 		Gamepad::PadOut gp_out;
 		gp_out.rumble_l = report_out_.motor_left;
 		gp_out.rumble_r = report_out_.motor_right;
 		gamepad.set_pad_out(gp_out);
 		new_report_out_ = false;
+
+		if (gp_out.rumble_l > 0 || gp_out.rumble_r > 0) {
+			rumble_actively_commanded = true;
+			last_rumble_rx_time = get_absolute_time();
+		} else {
+			rumble_actively_commanded = false;
+		}
+	} else if (rumble_actively_commanded) {
+		uint64_t elapsed_ms = to_ms_since_boot(get_absolute_time()) - to_ms_since_boot(last_rumble_rx_time);
+		if (elapsed_ms >= 2000) {
+			Gamepad::PadOut gp_out;
+			gp_out.rumble_l = 0;
+			gp_out.rumble_r = 0;
+			gamepad.set_pad_out(gp_out);
+			report_out_.motor_left = 0;
+			report_out_.motor_right = 0;
+			rumble_actively_commanded = false;
+		}
 	}
 }
 
@@ -261,19 +282,28 @@ uint16_t PS4Device::get_report_cb(uint8_t itf, uint8_t report_id, hid_report_typ
 void PS4Device::set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
 {
 	(void)itf;
-	if (report_type != HID_REPORT_TYPE_OUTPUT) {
+	if (report_type != HID_REPORT_TYPE_OUTPUT || bufsize == 0) {
 		return;
 	}
+
 	uint8_t rid = report_id;
-	const uint8_t *buf = buffer;
-	uint16_t len = bufsize;
-	if (rid == 0 && len > 0) {
+	const uint8_t *payload = buffer;
+	uint16_t payload_len = bufsize;
+
+	if (rid == 0) {
 		rid = buffer[0];
-		len = static_cast<uint16_t>(len - 1u);
-		buf = &buffer[1];
+		payload = &buffer[1];
+		payload_len = static_cast<uint16_t>(bufsize - 1u);
 	}
-	if (rid == 0x05 && len >= sizeof(PS4::OutReport)) {
-		std::memcpy(&report_out_, buf, sizeof(PS4::OutReport));
+
+	if (rid == 0x05) {
+		if (payload[0] == 0x05 && payload_len >= sizeof(PS4::OutReport)) {
+			std::memcpy(&report_out_, payload, sizeof(PS4::OutReport));
+		} else {
+			report_out_.report_id = 0x05;
+			const size_t copy_len = std::min<size_t>(payload_len, sizeof(PS4::OutReport) - 1u);
+			std::memcpy(reinterpret_cast<uint8_t*>(&report_out_) + 1, payload, copy_len);
+		}
 		new_report_out_ = true;
 	}
 }
