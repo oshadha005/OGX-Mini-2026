@@ -963,6 +963,17 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
     out_report_.command = SwitchPro::CMD::RUMBLE_ONLY;
     out_report_.sequence_counter = get_output_sequence_counter();
 
+    /* Valid Switch HD rumble framing with true 0-amplitude to prevent 0x3F mode drop */
+    out_report_.rumble_l[0] = 0x00;
+    out_report_.rumble_l[1] = 0x01;
+    out_report_.rumble_l[2] = 0x40;
+    out_report_.rumble_l[3] = 0x00;
+
+    out_report_.rumble_r[0] = 0x00;
+    out_report_.rumble_r[1] = 0x01;
+    out_report_.rumble_r[2] = 0x40;
+    out_report_.rumble_r[3] = 0x00;
+
     Gamepad::PadOut gp_out = gamepad.get_pad_out();
 
     if (gp_out.rumble_l > 0)
@@ -993,6 +1004,8 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
     {
         manage_rumble(gamepad);
         return true;
+    }
+    return false;
     }
     return false;
 }
