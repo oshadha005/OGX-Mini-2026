@@ -294,15 +294,12 @@ void PS4Device::set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t 
 		rid = buffer[0];
 		payload = &buffer[1];
 		len = static_cast<uint16_t>(bufsize - 1u);
+	} else if (payload[0] == 0x05 && len > 1) {
+		payload = &buffer[1];
+		len = static_cast<uint16_t>(len - 1u);
 	}
 
 	if (rid == 0x05) {
-		/* DS4 USB Output Report (31 payload bytes without ID, or 32 with ID).
-		 * Byte offsets in raw payload (excluding Report ID 0x05):
-		 *   payload[0] = flags
-		 *   payload[3] = right motor (light/high freq)
-		 *   payload[4] = left motor (heavy/low freq)
-		 */
 		if (len >= 5) {
 			report_out_.report_id = 0x05;
 			report_out_.motor_right = payload[3];
