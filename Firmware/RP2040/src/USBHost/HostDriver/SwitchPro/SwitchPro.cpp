@@ -51,26 +51,6 @@ bool switch_rearm_hid_in(uint8_t address, uint8_t instance) {
 }
 
 constexpr uint8_t kInitForceAdvanceRetries = 8;
-constexpr uint8_t kSubcmdEnableVibration = 0x48;
-
-/**
- * Encodes an 8-bit motor intensity (0..255) into Switch rumble format.
- * Sends strict 0x00 across all bytes when intensity is 0 to ensure ERM motors spin down.
- */
-void encode_switch_rumble(uint8_t* dst, uint8_t intensity) {
-    if (intensity == 0) {
-        dst[0] = 0x00;
-        dst[1] = 0x00;
-        dst[2] = 0x00;
-        dst[3] = 0x00;
-        return;
-    }
-    const uint8_t step = static_cast<uint8_t>(((static_cast<uint16_t>(intensity) * 99U) / 255U) + 1U);
-    dst[0] = 0x00;
-    dst[1] = static_cast<uint8_t>(0x01U + (step * 2U));
-    dst[2] = static_cast<uint8_t>(0x40U | ((step & 1U) ? 0x80U : 0x00U));
-    dst[3] = static_cast<uint8_t>(0x40U + (step / 2U));
-}
 
 } // namespace
 
@@ -487,7 +467,6 @@ void SwitchProHost::switch2_finish_bringup()
 
     if (bulk_complete)
     {
-        /* Switch 2–family: bulk bring-up replaces Switch 1 wired 0x80 HID init. */
         init_state_ = InitState::DONE;
         pending_usb_ack_ = 0;
         pending_subcmd_ack_ = 0;
@@ -528,8 +507,14 @@ void SwitchProHost::start_usb_wired_init(uint8_t address, uint8_t instance)
 
 void SwitchProHost::fill_neutral_rumble(SwitchPro::OutReport& out)
 {
-    std::memset(out.rumble_l, 0, sizeof(out.rumble_l));
-    std::memset(out.rumble_r, 0, sizeof(out.rumble_r));
+    out.rumble_l[0] = 0x00;
+    out.rumble_l[1] = 0x01;
+    out.rumble_l[2] = 0x40;
+    out.rumble_l[3] = 0x40;
+    out.rumble_r[0] = 0x00;
+    out.rumble_r[1] = 0x01;
+    out.rumble_r[2] = 0x40;
+    out.rumble_r[3] = 0x40;
 }
 
 void SwitchProHost::advance_after_usb_ack(Gamepad& gamepad, uint8_t address, uint8_t instance)
@@ -569,15 +554,13 @@ void SwitchProHost::send_usb_disable_timeout_and_probe(uint8_t address, uint8_t 
         OGXM_LOG("\n[CYCLONE2 SWITCH]\nUSB handshake: PASS (disable-timeout sent)\n");
         OGXM_LOG("Minimal init: DEVICE_INFO then SET_REPORT_MODE 0x30 (report ID 0x01)\n");
 #endif
-        /* Standard first subcommand — wait for real 0x21 before SET_MODE. */
         (void)send_subcmd_report(address, instance, SwitchPro::SUBCMD_DEVICE_INFO, nullptr, 0);
-        init_state_ = InitState::FULL_REPORT; /* next step after DEVICE_INFO ack */
+        init_state_ = InitState::FULL_REPORT;
         return;
     }
 
     std::memset(&out_report_, 0, sizeof(out_report_));
     fill_neutral_rumble(out_report_);
-    /* Nintendo rumble+subcmd report ID is 0x01 (not legacy 0x12). */
     out_report_.command = SwitchPro::REPORT_ID_OUTPUT_SUBCMD;
     out_report_.sequence_counter = get_output_sequence_counter();
     out_report_.sub_command = SwitchPro::CMD::USB_PROBE;
@@ -600,7 +583,6 @@ bool SwitchProHost::send_subcmd_report(uint8_t address, uint8_t instance, uint8_
         std::memcpy(out_report_.sub_command_args, args, n);
     }
     pending_subcmd_ack_ = subcmd;
-    /* Length: command + seq + rumble(8) + subcmd + args (min 1 arg slot). */
     const uint16_t len = static_cast<uint16_t>(11 + (args_len > 0 ? args_len : 0));
     return try_hid_out(address, instance, &out_report_, len > 12 ? len : 12);
 }
@@ -641,7 +623,6 @@ void SwitchProHost::init_switch_host(Gamepad& gamepad, uint8_t address, uint8_t 
 
     if (init_profile_ == InitProfile::MinimalReportMode)
     {
-        /* Retries only resend pending subcmd — never mark DONE without protocol success. */
         if (init_state_ == InitState::FULL_REPORT &&
             pending_subcmd_ack_ == SwitchPro::SUBCMD_DEVICE_INFO)
         {
@@ -692,14 +673,6 @@ void SwitchProHost::init_switch_host(Gamepad& gamepad, uint8_t address, uint8_t 
             break;
         case InitState::IMU:
             out_report_.sub_command = SwitchPro::CMD::GYRO;
-            out_report_.sub_command_args[0] = 1;
-            if (try_hid_out(address, instance, &out_report_, 12))
-            {
-                init_state_ = InitState::VIBRATION;
-            }
-            break;
-        case InitState::VIBRATION:
-            out_report_.sub_command = kSubcmdEnableVibration;
             out_report_.sub_command_args[0] = 1;
             if (try_hid_out(address, instance, &out_report_, 12))
             {
@@ -882,8 +855,6 @@ void SwitchProHost::process_report(Gamepad& gamepad, uint8_t address, uint8_t in
                     else if (reply_sub == SwitchPro::SUBCMD_SET_MODE)
                     {
                         set_mode_acked_ = true;
-                        const uint8_t vib_on = 1;
-                        (void)send_subcmd_report(address, instance, kSubcmdEnableVibration, &vib_on, 1);
                         pending_subcmd_ack_ = 0;
 #if defined(CONFIG_OGXM_DEBUG)
                         OGXM_LOG("[CYCLONE2 SWITCH]\nSET_REPORT_MODE 0x30: PASS (0x21)\n");
@@ -957,7 +928,6 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
     {
         if (init_profile_ == InitProfile::MinimalReportMode)
         {
-            /* Never READY-by-timeout: only resend pending protocol step. */
             init_switch_host(gamepad, address, instance);
             tuh_hid_receive_report(address, instance);
             service_usb_host();
@@ -995,12 +965,34 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
 
     Gamepad::PadOut gp_out = gamepad.get_pad_out();
 
-    encode_switch_rumble(out_report_.rumble_l, gp_out.rumble_l);
-    encode_switch_rumble(out_report_.rumble_r, gp_out.rumble_r);
+    if (gp_out.rumble_l > 0)
+    {
+        uint8_t amplitude_l = static_cast<uint8_t>(((gp_out.rumble_l / 255.0f) * 0.8f + 0.5f) * (0xC0 - 0x40) + 0x40);
+
+        out_report_.rumble_l[0] = amplitude_l;
+        out_report_.rumble_l[1] = 0x88;
+        out_report_.rumble_l[2] = amplitude_l / 2;
+        out_report_.rumble_l[3] = 0x61;
+    }
+
+    if (gp_out.rumble_r > 0)
+    {
+        uint8_t amplitude_r = static_cast<uint8_t>(((gp_out.rumble_r / 255.0f) * 0.8f + 0.5f) * (0xC0 - 0x40) + 0x40);
+
+        out_report_.rumble_r[0] = amplitude_r;
+        out_report_.rumble_r[1] = 0x88;
+        out_report_.rumble_r[2] = amplitude_r / 2;
+        out_report_.rumble_r[3] = 0x61;
+    }
 
     if (!tuh_hid_send_ready(address, instance))
     {
         return false;
     }
-    return tuh_hid_send_report(address, instance, 0, &out_report_, 10);
+    if (tuh_hid_send_report(address, instance, 0, &out_report_, 10))
+    {
+        manage_rumble(gamepad);
+        return true;
+    }
+    return false;
 }
