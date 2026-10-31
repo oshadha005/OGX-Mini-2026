@@ -1006,6 +1006,4 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
         return true;
     }
     return false;
-    }
-    return false;
 }
