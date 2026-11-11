@@ -781,6 +781,18 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
     if (payload_len >= 22) {
         gp_in.motion_source = Gamepad::PadIn::MOTION_SRC_SWITCH_USB;
         MotionImu::fill_from_switch_usb_payload(gp_in.accel, gp_in.gyro, payload, payload_len);
+
+        // FIX: Coordinate Frame Transformation from Switch Pro to DualShock 4
+        // gp_in.gyro/accel arrays map [x, y, z] to indices [0, 1, 2]
+        int16_t temp_gyro_y = gp_in.gyro[1];
+        int16_t temp_gyro_z = gp_in.gyro[2];
+        gp_in.gyro[1] = temp_gyro_z;             // DS4 Yaw = Switch Yaw (Z)
+        gp_in.gyro[2] = (int16_t)(-temp_gyro_y); // DS4 Roll = Inverted Switch Roll (Y)
+
+        int16_t temp_accel_y = gp_in.accel[1];
+        int16_t temp_accel_z = gp_in.accel[2];
+        gp_in.accel[1] = temp_accel_z;             // DS4 Vertical/Forward = Switch Z
+        gp_in.accel[2] = (int16_t)(-temp_accel_y); // DS4 Gravity = Inverted Switch Y
     }
 
     gamepad.set_pad_in_latest(gp_in);
@@ -967,12 +979,12 @@ bool SwitchProHost::send_feedback(Gamepad& gamepad, uint8_t address, uint8_t ins
     out_report_.rumble_l[0] = 0x00;
     out_report_.rumble_l[1] = 0x01;
     out_report_.rumble_l[2] = 0x40;
-    out_report_.rumble_l[3] = 0x00;
+    out_report_.rumble_l[3] = 0x40; // FIX: Switch Pro Neutral Rumble requires 0x40
 
     out_report_.rumble_r[0] = 0x00;
     out_report_.rumble_r[1] = 0x01;
     out_report_.rumble_r[2] = 0x40;
-    out_report_.rumble_r[3] = 0x00;
+    out_report_.rumble_r[3] = 0x40; // FIX: Switch Pro Neutral Rumble requires 0x40
 
     Gamepad::PadOut gp_out = gamepad.get_pad_out();
 
