@@ -778,21 +778,9 @@ void SwitchProHost::apply_standard_input(Gamepad& gamepad, const uint8_t* report
     std::tie(gp_in.joystick_rx, gp_in.joystick_ry) =
         gamepad.scale_joystick_r(normalize_axis(joy_rx), normalize_axis(joy_ry), true);
 
-        if (payload_len >= 22) {
+           if (payload_len >= 22) {
         gp_in.motion_source = Gamepad::PadIn::MOTION_SRC_SWITCH_USB;
         MotionImu::fill_from_switch_usb_payload(gp_in.accel, gp_in.gyro, payload, payload_len);
-
--       // FIX: Coordinate Frame Transformation from Switch Pro to DualShock 4
--       // gp_in.gyro/accel arrays map [x, y, z] to indices [0, 1, 2]
--       int16_t temp_gyro_y = gp_in.gyro[1];
--       int16_t temp_gyro_z = gp_in.gyro[2];
--       gp_in.gyro[1] = temp_gyro_z;
--       gp_in.gyro[2] = (int16_t)(-temp_gyro_y);
--
--       int16_t temp_accel_y = gp_in.accel[1];
--       int16_t temp_accel_z = gp_in.accel[2];
--       gp_in.accel[1] = temp_accel_z;
--       gp_in.accel[2] = (int16_t)(-temp_accel_y);
     }
 
     gamepad.set_pad_in_latest(gp_in);
